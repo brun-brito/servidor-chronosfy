@@ -89,16 +89,16 @@ exports.getProfissionalById = async (req, res) => {
 exports.updateProfissional = async (req, res) => {
     try {
       const { id } = req.params; // ID do profissional na URL
-      const validFields = [
+      const requiredFields = [
         "nome",
-        "cnpj",
-        "cpf",
         "email",
         "telefone",
-        "endereco", // Novo campo permitido
         "horario_funcionamento",
         "servicos",
-      ]; // Campos permitidos para atualização
+        "endereco",
+      ]; // Campos obrigatórios
+      const optionalFields = ["cnpj", "cpf"]; // Campos opcionais
+      const validFields = [...requiredFields, ...optionalFields]; // Todos os campos permitidos
   
       const updates = req.body;
   
@@ -109,27 +109,65 @@ exports.updateProfissional = async (req, res) => {
         return res.status(404).json({ error: "Profissional não encontrado." });
       }
   
-      // Filtrar campos válidos
-      const filteredUpdates = {};
-      for (const key in updates) {
-        if (validFields.includes(key)) {
-          filteredUpdates[key] = updates[key];
+      // Dados atuais do documento
+      const currentData = doc.data();
+  
+      // Validar campos obrigatórios na atualização
+      const missingFields = requiredFields.filter(
+        (field) => !updates[field] && !currentData[field]
+      );
+      if (missingFields.length > 0) {
+        return res.status(400).json({
+          error: `Os seguintes campos obrigatórios estão faltando: ${missingFields.join(", ")}`,
+        });
+      }
+  
+      // Verificar se pelo menos "cnpj" ou "cpf" está presente (no banco ou na atualização)
+      if (!updates.cnpj && !updates.cpf && !currentData.cnpj && !currentData.cpf) {
+        return res.status(400).json({
+          error: "É necessário informar pelo menos o campo 'cnpj' ou 'cpf'.",
+        });
+      }
+  
+      // Garantir que todos os dias da semana estejam no horario_funcionamento
+      const defaultSchedule = {
+        dom: null,
+        seg: null,
+        ter: null,
+        qua: null,
+        qui: null,
+        sex: null,
+        sab: null,
+      };
+  
+      const horario_funcionamento = updates.horario_funcionamento
+        ? {
+            ...defaultSchedule,
+            ...updates.horario_funcionamento,
+          }
+        : currentData.horario_funcionamento;
+  
+      // Determinar os campos que mudaram
+      const updatedFields = {};
+      for (const key of validFields) {
+        if (updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(currentData[key])) {
+          updatedFields[key] = key === "horario_funcionamento" ? horario_funcionamento : updates[key];
         }
       }
   
-      // Verificar se há campos para atualizar
-      if (Object.keys(filteredUpdates).length === 0) {
+      // Verificar se há campos realmente alterados
+      if (Object.keys(updatedFields).length === 0) {
         return res.status(400).json({
-          error: "Nenhum campo válido foi enviado para atualização.",
+          error: "Nenhum campo foi alterado.",
         });
       }
   
       // Atualizar documento no Firestore
-      await docRef.update(filteredUpdates);
+      await docRef.update(updatedFields);
   
       res.status(200).json({
         message: "Profissional atualizado com sucesso.",
-        updatedFields: filteredUpdates,
+        updatedFields, // Retorna apenas os campos alterados
       });
     } catch (error) {
       res.status(500).json({
