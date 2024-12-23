@@ -1,9 +1,10 @@
 const { db, admin } = require("../config/firebase");
+const { Timestamp } = require("firebase-admin/firestore");
 
 exports.createAgendamento = async (req, res) => {
   try {
     const { id_empresa } = req.params;
-    const requiredFields = ["horario", "nome", "servicos", "valor"];
+    const requiredFields = ["horario", "nome", "servicos"];
     const data = req.body;
 
     // Verificar campos obrigatórios
@@ -14,10 +15,98 @@ exports.createAgendamento = async (req, res) => {
       });
     }
 
-    // Garantir que "horario" tenha exatamente dois timestamps
-    if (!Array.isArray(data.horario) || data.horario.length !== 2) {
+    // Validar serviços e calcular o tempo total
+    if (!Array.isArray(data.servicos) || data.servicos.length === 0) {
+      return res.status(400).json({ error: "É necessário selecionar pelo menos um serviço." });
+    }
+
+    const profissionalDoc = await db.collection("profissionais").doc(id_empresa).get();
+    if (!profissionalDoc.exists) {
+      return res.status(404).json({ error: "Profissional não encontrado." });
+    }
+
+    const { horario_funcionamento, servicos } = profissionalDoc.data();
+
+    const servicosEscolhidos = data.servicos.map((servicoNome) => {
+      const servico = servicos.find((s) => s.nome === servicoNome);
+      if (!servico) {
+        throw new Error(`Serviço "${servicoNome}" não encontrado.`);
+      }
+      return servico;
+    });
+
+    const tempoTotal = servicosEscolhidos.reduce((total, servico) => total + servico.tempo_estimado, 0);
+
+    console.log("Tempo total necessário (minutos):", tempoTotal);
+
+    // Calcular horário de início e término
+    const start = new Date(data.horario[0]);
+    const end = new Date(start.getTime() + tempoTotal * 60 * 1000); // Adicionar o tempo em milissegundos
+
+    console.log("Horário solicitado (start):", start);
+    console.log("Horário solicitado (end):", end);
+
+    // Validar horário de funcionamento
+    const diaSemana = start.toLocaleDateString("pt-BR", { weekday: "short" }).toLowerCase();
+    const removeAcentos = (str) =>
+      str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z]/g, "");
+    const diaSemanaKey = removeAcentos(diaSemana);
+
+    const horarioHoje = horario_funcionamento[diaSemanaKey];
+    if (!horarioHoje) {
       return res.status(400).json({
-        error: "O campo 'horario' deve ser um array com dois timestamps (start e end).",
+        error: "Este dia não possui horário de funcionamento definido.",
+      });
+    }
+
+    const horarioInicio = new Date(`${start.toISOString().split("T")[0]}T${horarioHoje[0]}:00`);
+    const horarioFim = new Date(`${start.toISOString().split("T")[0]}T${horarioHoje[1]}:00`);
+
+    if (start < horarioInicio || end > horarioFim) {
+      return res.status(400).json({
+        error: "O horário selecionado está fora do intervalo definido no horário de funcionamento.",
+      });
+    }
+
+    // Consultar agendamentos existentes
+    const agendamentosSnapshot = await db
+      .collection("profissionais")
+      .doc(id_empresa)
+      .collection("agendamentos")
+      .where("horario.inicio", ">=", Timestamp.fromDate(horarioInicio))
+      .where("horario.fim", "<=", Timestamp.fromDate(horarioFim))
+      .get();
+
+    const agendamentos = agendamentosSnapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+      horario: {
+        inicio: doc.data().horario.inicio.toDate(),
+        fim: doc.data().horario.fim.toDate(),
+      },
+    }));
+
+    console.log("Agendamentos encontrados:", agendamentos);
+
+    // Verificar conflitos detalhados
+    const conflito = agendamentos.some((agendamento) => {
+      const { inicio: agendamentoStart, fim: agendamentoEnd } = agendamento.horario;
+
+      console.log("Comparando com agendamento existente:", {
+        agendamentoStart,
+        agendamentoEnd,
+        start,
+        end,
+      });
+
+      return (
+        (start < agendamentoEnd && end > agendamentoStart) // Intervalos sobrepostos
+      );
+    });
+
+    if (conflito) {
+      return res.status(400).json({
+        error: "O horário selecionado já está ocupado por outro agendamento.",
       });
     }
 
@@ -27,18 +116,21 @@ exports.createAgendamento = async (req, res) => {
       .doc(id_empresa)
       .collection("agendamentos")
       .add({
-        horario: data.horario,
+        horario: { inicio: Timestamp.fromDate(start), fim: Timestamp.fromDate(end) },
         nome: data.nome,
         observacao: data.observacao || "",
         servicos: data.servicos,
-        valor: data.valor,
+        valor: servicosEscolhidos.reduce((total, servico) => total + servico.valor, 0), // Somar valores dos serviços
       });
+
+    console.log("Agendamento criado com sucesso:", { id: docRef.id, ...data });
 
     res.status(201).json({
       message: "Agendamento criado com sucesso!",
       id: docRef.id,
     });
   } catch (error) {
+    console.error("Erro ao criar agendamento:", error);
     res.status(500).json({
       error: "Erro ao criar agendamento.",
       details: error.message,

@@ -5,15 +5,16 @@ exports.createProfissional = async (req, res) => {
       const requiredFields = [
         "nome",
         "email",
+        "senha", // Adicionar senha como campo obrigatório
         "telefone",
         "horario_funcionamento",
         "servicos",
         "endereco",
       ];
       const optionalFields = ["cnpj", "cpf"]; // Um dos dois deve estar presente
-  
+
       const data = req.body;
-  
+
       // Verificar campos obrigatórios
       const missingFields = requiredFields.filter((field) => !data[field]);
       if (missingFields.length > 0) {
@@ -21,14 +22,14 @@ exports.createProfissional = async (req, res) => {
           error: `Os seguintes campos estão faltando: ${missingFields.join(", ")}`,
         });
       }
-  
+
       // Verificar se pelo menos "cnpj" ou "cpf" foi fornecido
       if (!data.cnpj && !data.cpf) {
         return res.status(400).json({
           error: "É necessário informar pelo menos o campo 'cnpj' ou 'cpf'.",
         });
       }
-  
+
       // Garantir que todos os dias da semana estejam no horario_funcionamento
       const defaultSchedule = {
         dom: null,
@@ -39,13 +40,22 @@ exports.createProfissional = async (req, res) => {
         sex: null,
         sab: null,
       };
-  
+
       const horario_funcionamento = {
         ...defaultSchedule,
         ...data.horario_funcionamento,
       };
-  
-      // Filtrar campos extras
+
+      // Criar o usuário no Firebase Authentication
+      const userRecord = await admin.auth().createUser({
+        email: data.email,
+        password: data.senha,
+        displayName: data.nome,
+      });
+
+      const uid = userRecord.uid;
+
+      // Dados a serem salvos no Firestore
       const validData = {
         nome: data.nome,
         cnpj: data.cnpj || null,
@@ -55,17 +65,27 @@ exports.createProfissional = async (req, res) => {
         endereco: data.endereco,
         horario_funcionamento,
         servicos: data.servicos,
+        criadoEm: admin.firestore.Timestamp.now(), // Adiciona um campo de data de criação
       };
-  
-      // Salvar no Firestore
-      const docRef = await db.collection("profissionais").add(validData);
-  
+
+      // Salvar no Firestore usando o UID como ID do documento
+      await db.collection("profissionais").doc(uid).set(validData);
+
       res.status(201).json({
         message: "Profissional criado com sucesso!",
-        id: docRef.id,
+        id: uid,
         data: validData,
       });
     } catch (error) {
+      console.error("Erro ao criar profissional:", error);
+
+      // Caso o usuário tenha sido criado no Firebase Auth, excluí-lo em caso de erro no Firestore
+      if (error.code === "auth/email-already-exists") {
+        return res.status(400).json({
+          error: "O email fornecido já está em uso.",
+        });
+      }
+
       res.status(500).json({
         error: "Erro ao criar profissional.",
         details: error.message,
