@@ -191,50 +191,150 @@ exports.getAllAgendamentos = async (req, res) => {
   exports.updateAgendamento = async (req, res) => {
     try {
       const { id_empresa, id_agendamento } = req.params;
-      const validFields = ["horario", "nome", "observacao", "servicos", "valor"];
       const updates = req.body;
   
-      // Verificar se o agendamento existe
-      const docRef = db
-        .collection("profissionais")
-        .doc(id_empresa)
-        .collection("agendamentos")
-        .doc(id_agendamento);
+      // Referência ao Firestore
+      const profissionaisRef = db.collection("profissionais").doc(id_empresa);
+      const docRef = profissionaisRef.collection("agendamentos").doc(id_agendamento);
   
-      const doc = await docRef.get();
-      if (!doc.exists) {
+      // Verificar se o agendamento existe
+      const agendamentoDoc = await docRef.get();
+      if (!agendamentoDoc.exists) {
         return res.status(404).json({ error: "Agendamento não encontrado." });
       }
   
-      // Filtrar campos válidos
-      const filteredUpdates = {};
-      for (const key in updates) {
-        if (validFields.includes(key)) {
-          filteredUpdates[key] = updates[key];
+      const agendamentoAtual = agendamentoDoc.data();
+  
+      // Obter informações do profissional
+      const profissionalDoc = await profissionaisRef.get();
+      if (!profissionalDoc.exists) {
+        return res.status(404).json({ error: "Profissional não encontrado." });
+      }
+  
+      const { servicos: servicosDisponiveis, horario_funcionamento } = profissionalDoc.data();
+  
+      // Atualizações Condicionais
+      const updatesToApply = {};
+  
+      // Nome
+      if (updates.nome && updates.nome !== agendamentoAtual.nome) {
+        updatesToApply.nome = updates.nome;
+      }
+  
+      // Horário
+      if (updates.horario && Array.isArray(updates.horario) && updates.horario.length > 0) {
+        const start = new Date(updates.horario[0]);
+  
+        // Validar horário de funcionamento
+        const diaSemana = start.toLocaleDateString("pt-BR", { weekday: "short" }).toLowerCase();
+        const removeAcentos = (str) =>
+          str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z]/g, "");
+        const diaSemanaKey = removeAcentos(diaSemana);
+  
+        const horarioHoje = horario_funcionamento[diaSemanaKey];
+        if (!horarioHoje) {
+          return res.status(400).json({
+            error: "Este dia não possui horário de funcionamento definido.",
+          });
+        }
+  
+        const horarioInicio = new Date(`${start.toISOString().split("T")[0]}T${horarioHoje[0]}:00`);
+        const horarioFim = new Date(`${start.toISOString().split("T")[0]}T${horarioHoje[1]}:00`);
+  
+        if (start < horarioInicio || start > horarioFim) {
+          return res.status(400).json({
+            error: "O horário selecionado está fora do intervalo definido no horário de funcionamento.",
+          });
+        }
+  
+        // Validar conflitos de agendamento
+        const agendamentosSnapshot = await profissionaisRef
+          .collection("agendamentos")
+          .where("horario.inicio", "<", new Date(start.getTime() + 24 * 60 * 60 * 1000)) // Limite de 24h
+          .where("horario.fim", ">", start)
+          .get();
+  
+        const conflitos = agendamentosSnapshot.docs.filter(
+          (doc) => doc.id !== id_agendamento
+        );
+  
+        if (conflitos.length > 0) {
+          return res.status(400).json({
+            error: "O horário selecionado está em conflito com outro agendamento.",
+          });
+        }
+  
+        // Recalcular horário final
+        const tempoTotal = agendamentoAtual.servicos.reduce(
+          (acc, servicoNome) => {
+            const servico = servicosDisponiveis.find((s) => s.nome === servicoNome);
+            return servico ? acc + servico.tempo_estimado : acc;
+          },
+          0
+        );
+  
+        const end = new Date(start.getTime() + tempoTotal * 60 * 1000);
+  
+        updatesToApply.horario = { inicio: start, fim: end };
+      }
+  
+      // Serviços
+      if (Array.isArray(updates.servicos)) {
+        if (updates.servicos.length === 0) {
+          return res.status(400).json({
+            error: "É necessário selecionar pelo menos um serviço.",
+          });
+        }
+  
+        // Validar e calcular valor e tempo
+        const servicosSelecionados = updates.servicos.map((nomeServico) => {
+          const servico = servicosDisponiveis.find((s) => s.nome === nomeServico);
+          if (!servico) {
+            throw new Error(`Serviço "${nomeServico}" não encontrado.`);
+          }
+          return servico;
+        });
+  
+        const valorTotal = servicosSelecionados.reduce((acc, servico) => acc + servico.valor, 0);
+        const tempoTotal = servicosSelecionados.reduce((acc, servico) => acc + servico.tempo_estimado, 0);
+  
+        updatesToApply.servicos = updates.servicos;
+        updatesToApply.valor = valorTotal;
+  
+        // Recalcular horários
+        if (updates.horario && Array.isArray(updates.horario) && updates.horario.length > 0) {
+          const start = new Date(updates.horario[0]);
+          const end = new Date(start.getTime() + tempoTotal * 60 * 1000);
+          updatesToApply.horario = { inicio: start, fim: end };
         }
       }
   
-      // Verificar se há campos para atualizar
-      if (Object.keys(filteredUpdates).length === 0) {
-        return res.status(400).json({
-          error: "Nenhum campo válido foi enviado para atualização.",
-        });
+      // Observação
+      if (updates.observacao && updates.observacao !== agendamentoAtual.observacao) {
+        updatesToApply.observacao = updates.observacao;
       }
   
       // Atualizar agendamento no Firestore
-      await docRef.update(filteredUpdates);
-  
-      res.status(200).json({
-        message: "Agendamento atualizado com sucesso.",
-        updatedFields: filteredUpdates,
-      });
+      if (Object.keys(updatesToApply).length > 0) {
+        await docRef.update(updatesToApply);
+        return res.status(200).json({
+          message: "Agendamento atualizado com sucesso.",
+          updatedFields: updatesToApply,
+        });
+      } else {
+        return res.status(400).json({
+          error: "Nenhuma mudança válida foi enviada para atualização.",
+        });
+      }
     } catch (error) {
+      console.error("Erro ao atualizar agendamento:", error);
       res.status(500).json({
         error: "Erro ao atualizar agendamento.",
         details: error.message,
       });
     }
   };
+  
 
   exports.deleteAgendamento = async (req, res) => {
     try {
