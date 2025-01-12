@@ -64,7 +64,7 @@ exports.createAgendamento = async (req, res) => {
 
     if (start < horarioInicio || end > horarioFim) {
       return res.status(400).json({
-        error: "O horário selecionado está fora do intervalo definido no horário de funcionamento.",
+        error: `O horário selecionado está fora do intervalo definido no horário de funcionamento (${horarioHoje[0]} - ${horarioHoje[1]}).`,
       });
     }
 
@@ -110,12 +110,15 @@ exports.createAgendamento = async (req, res) => {
       });
     }
 
+    const id_user = data.id || db.collection("profissionais").doc().id; 
+
     // Criar agendamento no Firestore
     const docRef = await db
       .collection("profissionais")
       .doc(id_empresa)
       .collection("agendamentos")
       .add({
+        id_user: id_user,
         horario: { inicio: Timestamp.fromDate(start), fim: Timestamp.fromDate(end) },
         nome: data.nome,
         observacao: data.observacao || "",
@@ -220,11 +223,22 @@ exports.getAllAgendamentos = async (req, res) => {
       if (updates.nome && updates.nome !== agendamentoAtual.nome) {
         updatesToApply.nome = updates.nome;
       }
-  
+
+      // Validar e calcular valor e tempo
+      const servicosSelecionados = updates.servicos.map((nomeServico) => {
+        const servico = servicosDisponiveis.find((s) => s.nome === nomeServico);
+        if (!servico) {
+          throw new Error(`Serviço "${nomeServico}" não encontrado.`);
+        }
+        return servico;
+      });
+      const tempoTotal = servicosSelecionados.reduce((acc, servico) => acc + servico.tempo_estimado, 0);
+      const valorTotal = servicosSelecionados.reduce((acc, servico) => acc + servico.valor, 0);
+      const start = new Date(updates.horario[0]);
+      const end = new Date(start.getTime() + tempoTotal * 60 * 1000);
+      
       // Horário
       if (updates.horario && Array.isArray(updates.horario) && updates.horario.length > 0) {
-        const start = new Date(updates.horario[0]);
-  
         // Validar horário de funcionamento
         const diaSemana = start.toLocaleDateString("pt-BR", { weekday: "short" }).toLowerCase();
         const removeAcentos = (str) =>
@@ -243,37 +257,51 @@ exports.getAllAgendamentos = async (req, res) => {
   
         if (start < horarioInicio || start > horarioFim) {
           return res.status(400).json({
-            error: "O horário selecionado está fora do intervalo definido no horário de funcionamento.",
+            error: `O horário selecionado está fora do intervalo definido no horário de funcionamento (${horarioHoje[0]} - ${horarioHoje[1]})`,
           });
         }
   
         // Validar conflitos de agendamento
         const agendamentosSnapshot = await profissionaisRef
           .collection("agendamentos")
-          .where("horario.inicio", "<", new Date(start.getTime() + 24 * 60 * 60 * 1000)) // Limite de 24h
-          .where("horario.fim", ">", start)
+          .where("horario.inicio", ">=", Timestamp.fromDate(horarioInicio))
+          .where("horario.fim", "<=", Timestamp.fromDate(horarioFim))
           .get();
   
-        const conflitos = agendamentosSnapshot.docs.filter(
-          (doc) => doc.id !== id_agendamento
-        );
-  
-        if (conflitos.length > 0) {
-          return res.status(400).json({
-            error: "O horário selecionado está em conflito com outro agendamento.",
+          const agendamentos = agendamentosSnapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
+            horario: {
+              inicio: doc.data().horario.inicio.toDate(),
+              fim: doc.data().horario.fim.toDate(),
+            },
+          }));
+      
+          console.log("Agendamentos encontrados:", agendamentos);
+      
+          // Verificar conflitos detalhados
+          const conflito = agendamentos.some((agendamento) => {
+            const { inicio: agendamentoStart, fim: agendamentoEnd } = agendamento.horario;
+      
+            console.log("Comparando com agendamento existente:", {
+              agendamentoStart,
+              agendamentoEnd,
+              start,
+              end,
+            });
+      
+            return (
+              agendamento.id !== updates.id && // Verifica se não é o mesmo agendamento
+              start < agendamentoEnd &&
+              end > agendamentoStart // Intervalos sobrepostos
+            );
           });
-        }
-  
-        // Recalcular horário final
-        const tempoTotal = agendamentoAtual.servicos.reduce(
-          (acc, servicoNome) => {
-            const servico = servicosDisponiveis.find((s) => s.nome === servicoNome);
-            return servico ? acc + servico.tempo_estimado : acc;
-          },
-          0
-        );
-  
-        const end = new Date(start.getTime() + tempoTotal * 60 * 1000);
+      
+          if (conflito) {
+            return res.status(400).json({
+              error: "O horário selecionado já está ocupado por outro agendamento.",
+            });
+          }
   
         updatesToApply.horario = { inicio: start, fim: end };
       }
@@ -285,18 +313,6 @@ exports.getAllAgendamentos = async (req, res) => {
             error: "É necessário selecionar pelo menos um serviço.",
           });
         }
-  
-        // Validar e calcular valor e tempo
-        const servicosSelecionados = updates.servicos.map((nomeServico) => {
-          const servico = servicosDisponiveis.find((s) => s.nome === nomeServico);
-          if (!servico) {
-            throw new Error(`Serviço "${nomeServico}" não encontrado.`);
-          }
-          return servico;
-        });
-  
-        const valorTotal = servicosSelecionados.reduce((acc, servico) => acc + servico.valor, 0);
-        const tempoTotal = servicosSelecionados.reduce((acc, servico) => acc + servico.tempo_estimado, 0);
   
         updatesToApply.servicos = updates.servicos;
         updatesToApply.valor = valorTotal;
@@ -329,7 +345,7 @@ exports.getAllAgendamentos = async (req, res) => {
     } catch (error) {
       console.error("Erro ao atualizar agendamento:", error);
       res.status(500).json({
-        error: "Erro ao atualizar agendamento.",
+        error: "Erro interno ao atualizar agendamento.",
         details: error.message,
       });
     }
